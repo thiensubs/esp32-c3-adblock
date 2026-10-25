@@ -98,6 +98,25 @@ Printing notes:
   near it, or your RSSI will suffer.
 - Leave the vents open: the board idles around 45–55 °C.
 
+The C3 case does **not** fit an ESP8266 dev board (it is 44 × 25 mm, sized for
+the SuperMini footprint). For NodeMCU / D1 mini class boards use the parametric
+case: [`hardware/esp8266-enclosure.py`](hardware/esp8266-enclosure.py) writes the
+STL itself (no CAD tool needed), and
+[`hardware/esp8266-enclosure.scad`](hardware/esp8266-enclosure.scad) is the same
+geometry for OpenSCAD. Pre-generated for the 30 × 58 mm NodeMCU:
+[`hardware/esp8266-nodemcu-enclosure.stl`](hardware/esp8266-nodemcu-enclosure.stl)
+
+Measure the board first — width across the two header rows, and length from the
+USB end to the antenna end — then regenerate:
+
+```
+python3 hardware/esp8266-enclosure.py --board-w 30 --board-l 58 --out case.stl
+```
+
+It is a tray: the board drops in from the top, the side ribs catch the header
+strips, the end wall leaves a slot for the USB plug, and the antenna end is left
+open. Same printing notes as above.
+
 ## Build & flash (PlatformIO)
 
 One USB flash to get going — after that, **firmware and blocklist both update over WiFi** (see below).
