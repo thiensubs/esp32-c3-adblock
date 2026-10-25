@@ -53,7 +53,7 @@ private:
   void readStr(int addr, char* out, size_t n) {
     for (size_t i = 0; i < n - 1; i++) {
       uint8_t c = EEPROM.read(addr + i);
-      if (!c) break;
+      if (!c) { out[i] = 0; return; }
       out[i] = (char)c;
     }
     out[n - 1] = 0;
