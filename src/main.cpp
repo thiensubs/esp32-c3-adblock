@@ -38,7 +38,8 @@
 #ifndef UPSTREAM_PORT
 #define UPSTREAM_PORT 53
 #endif
-static const IPAddress UPSTREAM(UPSTREAM_IP);
+static const IPAddress UPSTREAM(UPSTREAM_IP);   // compile-time fallback
+static IPAddress upstreamDns;          // runtime upstream, see upstreamApply()
 static const uint16_t DNS_PORT = 53;
 static const char* BLOCKLIST_PATH = "/blocklist.bin";
 static const int HASH_BYTES = 5;
@@ -262,6 +263,48 @@ static Dev* getClient(uint32_t ip) {
   return nullptr;
 }
 
+// ---------- upstream resolver ----------
+// Allowed lookups are forwarded to one of:
+//   built-in (default) - the compile-time UPSTREAM_IP (Quad9). Independent of the LAN, which
+//                        matters because this box is often the BACKUP for a Pi-hole/AdGuard
+//                        that the router hands out over DHCP; forwarding there would fail
+//                        exactly when the backup is needed.
+//   router             - the DNS the router hands out over DHCP (else the gateway), opt-in.
+//   custom             - an address set on the dashboard.
+// Persisted in /upstream.cfg ("router" or an IPv4 address; absent = built-in).
+enum UpstreamMode { UP_BUILTIN, UP_ROUTER, UP_CUSTOM };
+static UpstreamMode upstreamMode = UP_BUILTIN;
+static IPAddress    upstreamSaved;               // the custom address, when UP_CUSTOM
+static const char*  upstreamSource = "built-in";
+// 0.0.0.0 and 255.255.255.255 parse as valid IPv4 but would silently stop all forwarding.
+static bool usableResolver(const IPAddress& ip) { return (uint32_t)ip != 0 && (uint32_t)ip != 0xFFFFFFFF; }
+static void upstreamApply() {
+  const IPAddress self = WiFi.localIP();
+  if (upstreamMode == UP_CUSTOM) { upstreamDns = upstreamSaved; upstreamSource = "custom"; return; }
+  if (upstreamMode == UP_ROUTER) {
+    const IPAddress dhcp = WiFi.dnsIP(), gw = WiFi.gatewayIP();
+    if ((uint32_t)dhcp != 0 && dhcp != self) { upstreamDns = dhcp; upstreamSource = "router (dhcp)"; return; }
+    if ((uint32_t)gw != 0 && gw != self)     { upstreamDns = gw;   upstreamSource = "router (gateway)"; return; }
+  }
+  upstreamDns = UPSTREAM; upstreamSource = "built-in";
+}
+static void upstreamLoad() {
+  upstreamMode = UP_BUILTIN;
+  File f = LittleFS.open("/upstream.cfg", "r");
+  if (f) {
+    String l = f.readStringUntil('\n'); l.trim(); f.close();
+    IPAddress ip;
+    if (l == "router") upstreamMode = UP_ROUTER;
+    else if (l.length() && ip.fromString(l) && usableResolver(ip)) { upstreamSaved = ip; upstreamMode = UP_CUSTOM; }
+  }
+  upstreamApply();
+}
+static void upstreamSave() {
+  if (upstreamMode == UP_BUILTIN) { LittleFS.remove("/upstream.cfg"); return; }
+  File f = LittleFS.open("/upstream.cfg", "w"); if (!f) return;
+  f.println(upstreamMode == UP_ROUTER ? String("router") : upstreamSaved.toString()); f.close();
+}
+
 // ---------- DNS ----------
 static size_t parseQuery(const uint8_t* pkt, int len, char* out, uint16_t* qtype, int* qend) {
   if (len < 13) return 0; int i = 12; size_t o = 0;
@@ -296,12 +339,12 @@ static int forwardUpstream(int qlen, int qend) {
   const bool haveQ = ql > 0 && ql <= (int)sizeof(q) && qend <= qlen;
   if (haveQ) memcpy(q, buf + 12, ql);
   buf[0] = wid >> 8; buf[1] = wid & 0xFF;
-  upstreamCli.beginPacket(UPSTREAM, UPSTREAM_PORT); upstreamCli.write(buf, qlen); upstreamCli.endPacket();
+  upstreamCli.beginPacket(upstreamDns, UPSTREAM_PORT); upstreamCli.write(buf, qlen); upstreamCli.endPacket();
   const uint32_t t0 = millis();
   while (millis() - t0 < 1000) {                         // deadline, not a retry count
     int sz = upstreamCli.parsePacket();
     if (sz <= 0) { delay(1); continue; }
-    const bool fromUp = upstreamCli.remoteIP() == UPSTREAM && upstreamCli.remotePort() == UPSTREAM_PORT;
+    const bool fromUp = upstreamCli.remoteIP() == upstreamDns && upstreamCli.remotePort() == UPSTREAM_PORT;
     int n = upstreamCli.read(buf, sizeof(buf));
     upstreamCli.flush();                                 // oversized datagram can't strand rx_buffer
     if (!fromUp || n < 12 || sz > (int)sizeof(buf)) continue;
@@ -366,6 +409,7 @@ static void handleStats() {
   String j = "{\"ip\":\"" + WiFi.localIP().toString() + "\",\"blocked\":" + totalBlocked + ",\"allowed\":" + totalAllowed +
              ",\"domains\":" + numHashes + ",\"rssi\":" + WiFi.RSSI() + ",\"temp\":" + String(temperatureRead(), 1) +
              ",\"heap\":" + ESP.getFreeHeap() + ",\"uptime\":\"" + ut + "\"" +
+             ",\"dns\":\"" + upstreamDns.toString() + "\",\"dnsSource\":\"" + upstreamSource + "\"" +
              ",\"upurl\":\"" + jesc(updateUrl) + "\",\"upiv\":" + updateIntervalH + ",\"upstat\":\"" + jesc(updateStatus) + "\"" +
              ",\"blocking\":" + (blockingOn ? "true" : "false") +
              ",\"resumeIn\":" + (uint32_t)(!blockingOn && resumeAt ? (resumeAt - millis()) / 1000 : 0) +
@@ -406,37 +450,79 @@ static void handleBan() {
 }
 
 // ---------- blocklist swap (shared by upload + remote fetch) ----------
-// The partition holds one list, so we free the old one before writing the new.
-// While swapping, numHashes=0 -> device fail-opens (forwards, no blocking).
+// A new list is written to /blocklist.new and only replaces the live list after it
+// validates. If the filesystem has room for both, the live list stays in use the whole
+// time (and survives a bad/truncated download). Only when space is short is the live
+// list freed first; then a rejected download leaves the device fail-open (forwarding,
+// no blocking) until the next good update.
 static void reopenBlocklist() {
   blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
   numHashes = blocklist ? blocklist.size() / HASH_BYTES : 0;
   buildFlashIndex();
 }
-static void beginBlocklistSwap() {
-  if (blocklist) blocklist.close();
-  numHashes = 0;
-  LittleFS.remove(BLOCKLIST_PATH);
-  LittleFS.remove("/blocklist.new");
+static size_t fsFree() {
+#if defined(ESP8266)
+  FSInfo i; LittleFS.info(i); return i.totalBytes - i.usedBytes;
+#else
+  return LittleFS.totalBytes() - LittleFS.usedBytes();
+#endif
 }
-static bool commitNewBlocklist() {                  // /blocklist.new -> live (validated)
-  File f = LittleFS.open("/blocklist.new", "r");
-  size_t sz = f ? f.size() : 0; if (f) f.close();
-  bool ok = sz > 0 && (sz % HASH_BYTES) == 0;       // sorted hash blob -> 5-byte multiple
-  if (ok) LittleFS.rename("/blocklist.new", BLOCKLIST_PATH);
-  else    LittleFS.remove("/blocklist.new");
+static bool swapKeptLive = false;                    // live list still open during this swap?
+static void beginBlocklistSwap(size_t expected) {    // expected = incoming size, 0 if unknown
+  LittleFS.remove("/blocklist.new");
+  if (!expected && blocklist) expected = blocklist.size();   // unknown: assume similar size
+  swapKeptLive = expected && fsFree() > expected + 16384;     // 16 KB littlefs slack
+  if (!swapKeptLive) {                               // no room for both: free the old list
+    if (blocklist) blocklist.close();
+    numHashes = 0;
+    LittleFS.remove(BLOCKLIST_PATH);
+  }
+  Serial.printf("[swap] incoming ~%u B, free %u B -> %s\n", (unsigned)expected, (unsigned)fsFree(),
+                swapKeptLive ? "keeping live list during update" : "freed live list first");
+}
+// Valid = non-empty, whole 5-byte entries, complete (if the size was announced), and
+// strictly ascending. The ordering check rejects HTML error pages, other forks' formats
+// and corrupted files, which the old "size % 5 == 0" test let through.
+static bool validBlocklistFile(const char* path, size_t expectSize, String& why) {
+  File f = LittleFS.open(path, "r");
+  if (!f) { why = "missing"; return false; }
+  size_t sz = f.size();
+  if (!sz || sz % HASH_BYTES) { f.close(); why = "size " + String((unsigned)sz) + " not a multiple of 5"; return false; }
+  if (expectSize && sz != expectSize) { f.close(); why = "truncated (" + String((unsigned)sz) + "/" + String((unsigned)expectSize) + " B)"; return false; }
+  uint8_t b[HASH_BYTES * 100]; uint64_t prev = 0; bool first = true; size_t idx = 0;
+  while (f.available()) {
+    int n = f.read(b, sizeof(b)); if (n <= 0) break;
+    for (int k = 0; k + HASH_BYTES <= n; k += HASH_BYTES, idx++) {
+      uint64_t v = unpackHash(b + k);
+      if (!first && v <= prev) { f.close(); why = "not a sorted blocklist (entry " + String((unsigned)idx) + ")"; return false; }
+      prev = v; first = false;
+    }
+  }
+  f.close(); return true;
+}
+static bool commitNewBlocklist(size_t expectSize, String& why) {   // /blocklist.new -> live
+  bool ok = validBlocklistFile("/blocklist.new", expectSize, why);
+  if (ok) {
+    if (blocklist) blocklist.close();
+    LittleFS.remove(BLOCKLIST_PATH);
+    LittleFS.rename("/blocklist.new", BLOCKLIST_PATH);
+  } else {
+    LittleFS.remove("/blocklist.new");
+    Serial.printf("[swap] rejected: %s%s\n", why.c_str(), swapKeptLive ? " (kept current list)" : "");
+    if (swapKeptLive) return false;                  // live list never left; nothing to reopen
+  }
   reopenBlocklist();
   return ok;
 }
 
 // ---------- OTA blocklist update (browser upload) ----------
 static bool upOk = false;
+static String upWhy;
 static bool upAuthOk = false;
 static File upFile;
 static void handleUploadDone() {
   if (!upAuthOk) { web.requestAuthentication(); return; }
-  web.send(upOk ? 200 : 500, "text/plain",
-           upOk ? "ok" : "rejected: empty or size not a multiple of 5 (not a blocklist.bin?)");
+  web.send(upOk ? 200 : 500, "text/plain", upOk ? String("ok") : "rejected: " + upWhy);
 }
 static void handleUpload() {
   HTTPUpload& u = web.upload();
@@ -444,7 +530,11 @@ static void handleUpload() {
     case UPLOAD_FILE_START:
       upAuthOk = web.header(CSRF_HEADER) == CSRF_VALUE && web.authenticate(WEB_USER, WEB_PASS);
       if (!upAuthOk) { Serial.println("[ota] blocklist upload: auth/CSRF check failed"); break; }
-      upOk = false; beginBlocklistSwap();
+#if defined(ESP8266)
+      upOk = false; beginBlocklistSwap(0);            // size unknown here: estimated from the live list
+#else
+      upOk = false; beginBlocklistSwap(web.clientContentLength());
+#endif
       upFile = LittleFS.open("/blocklist.new", "w");
       Serial.printf("[ota] receiving %s\n", u.filename.c_str());
       break;
@@ -454,13 +544,13 @@ static void handleUpload() {
     case UPLOAD_FILE_END:
       if (!upAuthOk) break;
       if (upFile) upFile.close();
-      upOk = commitNewBlocklist();
+      upOk = commitNewBlocklist(0, upWhy);
       Serial.printf("[ota] %s -> %u domains\n", upOk ? "OK" : "REJECTED", numHashes);
       break;
     case UPLOAD_FILE_ABORTED:
       if (!upAuthOk) break;
       if (upFile) upFile.close();
-      LittleFS.remove("/blocklist.new"); reopenBlocklist();
+      LittleFS.remove("/blocklist.new"); if (!swapKeptLive) reopenBlocklist();
       Serial.println("[ota] aborted");
       break;
   }
@@ -499,19 +589,21 @@ static bool fetchBlocklist(String url) {
   if (!(https ? http.begin(cs, url) : http.begin(cl, url))) { updateStatus = "begin failed"; return false; }
   int code = http.GET();
   if (code != HTTP_CODE_OK) { http.end(); updateStatus = "HTTP " + String(code); Serial.printf("[remote] %s\n", updateStatus.c_str()); return false; }
-  beginBlocklistSwap();
+  int len = http.getSize();
+  beginBlocklistSwap(len > 0 ? (size_t)len : 0);
   File f = LittleFS.open("/blocklist.new", "w");
-  if (!f) { http.end(); updateStatus = "fs open failed"; reopenBlocklist(); return false; }
-  WiFiClient* stream = http.getStreamPtr();
-  int len = http.getSize(); uint8_t b[1024]; size_t total = 0; uint32_t idle = millis();
+  if (!f) { http.end(); updateStatus = "fs open failed"; if (!swapKeptLive) reopenBlocklist(); return false; }
+  WiFiClient* stream = http.getStreamPtr(); uint8_t b[1024]; size_t total = 0; uint32_t idle = millis();
   while (http.connected() && (len < 0 || (int)total < len)) {
     size_t avail = stream->available();
     if (avail) { int n = stream->readBytes(b, avail > sizeof(b) ? sizeof(b) : avail); if (n > 0) { f.write(b, n); total += n; idle = millis(); } }
     else { if (millis() - idle > 15000) break; delay(2); }
   }
   f.close(); http.end();
-  bool ok = commitNewBlocklist();
-  updateStatus = ok ? ("ok: " + String(numHashes) + " domains") : ("bad data (" + String(total) + "B)");
+  String why;
+  bool ok = commitNewBlocklist(len > 0 ? (size_t)len : 0, why);
+  updateStatus = ok ? ("ok: " + String(numHashes) + " domains")
+                    : ("rejected: " + why + (swapKeptLive ? " (kept current list)" : ""));
   Serial.printf("[remote] %s\n", updateStatus.c_str());
   return ok;
 }
@@ -577,9 +669,23 @@ static bool connectWiFi() {
   if (!ssid || !*ssid || strcmp(ssid, "YOUR_WIFI_SSID") == 0) return false;  // unconfigured
   Serial.printf("WiFi: connecting to \"%s\"%s\n", ssid, ss.length() ? " (provisioned)" : " (secrets.h)");
   WiFi.mode(WIFI_STA); WiFi.setSleep(false); WiFi.begin(ssid, pass);
+#if defined(WIFI_TX_POWER) && !defined(ESP8266)
+  WiFi.setTxPower((wifi_power_t)WIFI_TX_POWER);    // e.g. -DWIFI_TX_POWER=WIFI_POWER_8_5dBm
+#endif
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 30000) { delay(250); Serial.print("."); }
   Serial.println();
+#if CONFIG_IDF_TARGET_ESP32C3 && !defined(WIFI_TX_POWER)
+  // Some C3 SuperMini boards have a badly matched antenna and only work at reduced TX
+  // power (#50). If full power didn't connect, retry once at 8.5 dBm before giving up.
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi: retrying at 8.5 dBm (C3 SuperMini antenna quirk)");
+    WiFi.disconnect(); delay(200); WiFi.begin(ssid, pass); WiFi.setTxPower(WIFI_POWER_8_5dBm);
+    t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) { delay(250); Serial.print("."); }
+    Serial.println();
+  }
+#endif
   return WiFi.status() == WL_CONNECTED;
 }
 
@@ -591,15 +697,20 @@ static void handlePortalRoot() {
     "<h2>&#128737; C3 AdBlock &mdash; WiFi setup</h2>"
     "<p style='color:#8b949e'>Pick your network and enter its password. The device restarts and joins it.</p>"
     "<form method=POST action=/wifisave>"
-    "<input list=nets name=s placeholder='WiFi name' required style='width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:6px;border:1px solid #30363d;background:#161b22;color:#c9d1d9'>"
-    "<datalist id=nets>" + portalOpts + "</datalist>"
+    // A real <select> is usable on every phone; the datalist this used to be
+    // renders an affordance in several in-app browsers but no list, so picking
+    // a network looked impossible. Typing the name still covers hidden APs.
+    "<select name=s style='width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:6px;border:1px solid #30363d;background:#161b22;color:#c9d1d9'>" + portalOpts + "</select>"
+    "<input name=s2 placeholder='or type the WiFi name' style='width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:6px;border:1px solid #30363d;background:#161b22;color:#c9d1d9'>"
     "<input name=p type=password placeholder='Password' style='width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:6px;border:1px solid #30363d;background:#161b22;color:#c9d1d9'>"
     "<button style='width:100%;padding:12px;margin-top:8px;border-radius:6px;border:0;background:#3fb950;color:#000;font-weight:600;cursor:pointer'>Connect</button>"
     "</form></body>";
   web.send(200, "text/html", html);
 }
 static void handleWifiSave() {
-  String ss = web.arg("s"), pw = web.arg("p");
+  String ss = web.arg("s2"); ss.trim();          // typed name wins
+  if (!ss.length()) ss = web.arg("s");           // ...otherwise the picked one
+  String pw = web.arg("p");
   if (!ss.length()) { web.send(400, "text/plain", "missing WiFi name"); return; }
   prefs.begin("wifi", false); prefs.putString("ssid", ss); prefs.putString("pass", pw); prefs.end();
   web.send(200, "text/html", "<!doctype html><meta charset=utf-8><body style='font:16px system-ui;text-align:center;margin-top:60px'>"
@@ -609,12 +720,29 @@ static void handleWifiSave() {
 }
 // Never returns — blocks in the portal loop until creds are saved (then reboots).
 static void startConfigPortal() {
-  int n = WiFi.scanNetworks();                 // scan while still in STA mode (no APSTA)
-  portalOpts = "";
-  for (int i = 0; i < n && i < 15; i++) portalOpts += "<option value='" + htmlEscape(WiFi.SSID(i)) + "'>";
+  // Bring the radio up before the first scan. An unconfigured device gets here
+  // straight from connectWiFi() without any WiFi call, and the first scan right
+  // after boot can come back empty - which left the network list with no
+  // entries at all. Start the station, then retry a few times.
+  WiFi.mode(WIFI_STA);
+  delay(200);
+  int n = 0;
+  for (int attempt = 1; attempt <= 3 && n <= 0; attempt++) {
+    if (attempt > 1) delay(700);
+    n = WiFi.scanNetworks();
+    Serial.printf("[setup] scan %d/3: %d networks\n", attempt, n);
+  }
+  portalOpts = "<option value=''>-- pick your network --</option>";
+  for (int i = 0; i < n && i < 15; i++) {
+    const String s = WiFi.SSID(i);
+    portalOpts += "<option value='" + htmlEscape(s) + "'>" + htmlEscape(s) + "</option>";
+  }
   uint8_t mac[6]; WiFi.macAddress(mac);
   char ap[24]; snprintf(ap, sizeof(ap), "C3-AdBlock-%02X%02X", mac[4], mac[5]);
   WiFi.mode(WIFI_AP); WiFi.softAP(ap);
+#if !defined(ESP8266)
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);          // the phone is right next to it; also avoids the
+#endif                                         // C3 SuperMini antenna quirk that hides the AP (#50)
   IPAddress apIP = WiFi.softAPIP();
   dnsPortal.start(53, "*", apIP);              // catch-all -> phones pop the captive portal
   web.on("/", handlePortalRoot);
@@ -648,7 +776,7 @@ void setup() {
     Serial.printf("blocklist: %u domains\n", numHashes);
     buildFlashIndex();
   }
-  loadCustom(); loadBanned(); loadUpdateCfg();
+  loadCustom(); loadBanned(); loadUpdateCfg(); upstreamLoad();
   Serial.printf("custom: %d, banned: %d\n", numCustom, numBanned);
   Serial.printf("[mem] free heap %u bytes\n", (unsigned)ESP.getFreeHeap());
 
@@ -667,6 +795,8 @@ void setup() {
 
   if (!connectWiFi()) startConfigPortal();   // portal blocks + reboots on save; returns only when connected
   Serial.printf("WiFi up: %s\n", WiFi.localIP().toString().c_str());
+  upstreamApply();                              // DHCP is up now (matters for "router" mode)
+  Serial.printf("upstream DNS: %s (%s)\n", upstreamDns.toString().c_str(), upstreamSource);
   if (MDNS.begin("c3adblock")) { MDNS.addService("http", "tcp", 80); Serial.println("dashboard: http://c3adblock.local"); }
 
   if (strcmp(WEB_PASS, "CHANGE_ME_WEB_PASSWORD") == 0 || strcmp(OTA_PASS, "CHANGE_ME_OTA_PASSWORD") == 0)
@@ -702,6 +832,21 @@ void setup() {
     if (web.hasArg("u")) updateUrl = web.arg("u");
     if (web.hasArg("h")) { updateIntervalH = web.arg("h").toInt(); if (updateIntervalH < 1) updateIntervalH = 1; }
     saveUpdateCfg(); web.send(200, "text/plain", "ok");
+  });
+  web.on("/setdns", []() {               // /setdns?ip=x.x.x.x | ?router=1 | ?reset=1 (built-in)
+    if (!requireAuth()) return;
+    if (web.hasArg("reset")) upstreamMode = UP_BUILTIN;
+    else if (web.hasArg("router")) upstreamMode = UP_ROUTER;
+    else {
+      IPAddress v;
+      if (!v.fromString(web.arg("ip"))) { web.send(400, "text/plain", "not an IPv4 address"); return; }
+      if (!usableResolver(v)) { web.send(400, "text/plain", "0.0.0.0 / broadcast is not a resolver"); return; }
+      if (v == WiFi.localIP()) { web.send(400, "text/plain", "that is this device; pick another resolver"); return; }
+      upstreamSaved = v; upstreamMode = UP_CUSTOM;
+    }
+    upstreamSave(); upstreamApply();
+    Serial.printf("[dns] upstream -> %s (%s)\n", upstreamDns.toString().c_str(), upstreamSource);
+    web.send(200, "text/plain", upstreamDns.toString());
   });
   web.begin();
   ArduinoOTA.setHostname("c3adblock");   // pio run -t upload --upload-port c3adblock.local
